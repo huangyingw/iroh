@@ -4,14 +4,28 @@
 //! usable IPv4 socket, so a remote's IPv4 direct addresses are unreachable as-is and the
 //! connection stays on the relay. Those IPv4 addresses are still reachable through the
 //! carrier's NAT64 gateway by sending to the IPv4-embedded IPv6 address synthesized from the
-//! network's NAT64 prefix. This module only contains the pure address logic; discovering the
-//! prefix requires resolving `ipv4only.arpa` (RFC 7050) and feeding the AAAA answers to
-//! [`Nat64Prefix::from_ipv4only_arpa`].
+//! network's NAT64 prefix.
+//!
+//! The translation is done transparently in the IP transports, like a userspace CLAT
+//! (RFC 6877): while a prefix is active, datagrams to a translatable IPv4 destination are sent
+//! from the IPv6 socket to the synthesized address, and datagrams received from an address
+//! inside the prefix are reported as coming from the embedded IPv4 address. The QUIC stack,
+//! path management and the remote never see the IPv6 form. Because the relay's QAD probes use
+//! the same sockets, an IPv4 QAD round trip then succeeds through NAT64 and yields the NAT64
+//! gateway's public address, which is published as a reflexive candidate for hole punching.
+//!
+//! [`Nat64State`] is written by net_report and read by the IP transports. See
+//! `net_report::Client::update_nat64` for when it is activated.
 //!
 //! Hand-written instead of depending on the `rfc6052` crate because that crate is GPL-3.0.
-#![allow(dead_code)] // wired into the endpoint in a follow-up change
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 /// The name resolved to discover the NAT64 prefix (RFC 7050 §2).
 pub(crate) const IPV4ONLY_ARPA: &str = "ipv4only.arpa.";
@@ -54,14 +68,6 @@ impl Nat64Prefix {
         })
     }
 
-    pub(crate) fn prefix(&self) -> Ipv6Addr {
-        self.prefix
-    }
-
-    pub(crate) fn len(&self) -> u8 {
-        self.len
-    }
-
     /// Builds the IPv4-embedded IPv6 address for `v4` (RFC 6052 §2.2).
     pub(crate) fn synthesize(&self, v4: Ipv4Addr) -> Ipv6Addr {
         let mut octets = self.prefix.octets();
@@ -99,6 +105,12 @@ impl Nat64Prefix {
     }
 }
 
+impl From<Nat64Prefix> for ipnet::Ipv6Net {
+    fn from(value: Nat64Prefix) -> Self {
+        ipnet::Ipv6Net::new(value.prefix, value.len).expect("RFC 6052 lengths are valid")
+    }
+}
+
 /// Byte positions holding the IPv4 octets for a given prefix length.
 ///
 /// Bits 64..72 (byte 8, the "u" octet) are reserved and always skipped (RFC 6052 §2.2).
@@ -129,10 +141,58 @@ fn extract_at(len: u8, octets: &[u8; 16]) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::from(v4))
 }
 
+/// The NAT64 prefix currently used for translation, shared between net_report and the IP
+/// transports.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Nat64State(Arc<Nat64StateInner>);
+
+#[derive(Debug, Default)]
+struct Nat64StateInner {
+    /// Fast path for the common case of no NAT64, checked on every IPv4 send / IPv6 receive.
+    active: AtomicBool,
+    prefix: RwLock<Option<Nat64Prefix>>,
+}
+
+impl Nat64State {
+    /// The active prefix, if translation is enabled.
+    pub(crate) fn get(&self) -> Option<Nat64Prefix> {
+        if !self.0.active.load(Ordering::Acquire) {
+            return None;
+        }
+        *self.0.prefix.read().expect("poisoned")
+    }
+
+    /// Enables translation with `prefix`, or disables it with `None`.
+    pub(crate) fn set(&self, prefix: Option<Nat64Prefix>) {
+        let mut guard = self.0.prefix.write().expect("poisoned");
+        *guard = prefix;
+        self.0.active.store(prefix.is_some(), Ordering::Release);
+    }
+
+    /// The address to send to instead of `dst`, if `dst` should go through NAT64.
+    pub(crate) fn translate_dst(&self, dst: SocketAddrV4) -> Option<SocketAddrV6> {
+        let prefix = self.get()?;
+        is_translatable(*dst.ip())
+            .then(|| SocketAddrV6::new(prefix.synthesize(*dst.ip()), dst.port(), 0, 0))
+    }
+
+    /// The IPv4 address a datagram from `src` originally came from, if it came through NAT64.
+    pub(crate) fn untranslate_src(&self, src: SocketAddrV6) -> Option<SocketAddrV4> {
+        let prefix = self.get()?;
+        let v4 = prefix.extract(*src.ip())?;
+        is_translatable(v4).then(|| SocketAddrV4::new(v4, src.port()))
+    }
+}
+
 /// Whether a remote IPv4 address is worth translating through NAT64.
 ///
-/// NAT64 only translates to globally routable IPv4 destinations (RFC 6052 §3.1), so private,
-/// shared (CGNAT), loopback, link-local and other special-purpose addresses are skipped.
+/// NAT64 only reaches globally routable IPv4 destinations (RFC 6052 §3.1), so addresses a
+/// remote may advertise but that are never reachable through it are skipped: private, shared
+/// (CGNAT), loopback, link-local, IETF protocol assignments (which include the CLAT address
+/// range `192.0.0.0/29`, RFC 7335), multicast and reserved.
+///
+/// The documentation and benchmarking ranges are deliberately not excluded: they never occur
+/// as real addresses, and network simulations (e.g. patchbay) use them as public addresses.
 pub(crate) fn is_translatable(v4: Ipv4Addr) -> bool {
     let [a, b, c, _] = v4.octets();
     !(v4.is_unspecified()
@@ -140,13 +200,11 @@ pub(crate) fn is_translatable(v4: Ipv4Addr) -> bool {
         || v4.is_loopback()
         || v4.is_link_local()
         || v4.is_broadcast()
-        || v4.is_documentation()
         || v4.is_multicast()
         || a == 0
         || a >= 240
         || (a == 100 && (b & 0xc0) == 64) // 100.64.0.0/10 shared address space
-        || (a == 192 && b == 0 && c == 0) // 192.0.0.0/24 IETF protocol assignments
-        || (a == 198 && (b & 0xfe) == 18)) // 198.18.0.0/15 benchmarking
+        || (a == 192 && b == 0 && c == 0)) // 192.0.0.0/24 IETF protocol assignments
 }
 
 #[cfg(test)]
@@ -194,8 +252,7 @@ mod tests {
 
     #[test]
     fn new_clears_bits_beyond_prefix() {
-        let prefix = p("2001:db8:ffff:ffff::1", 32);
-        assert_eq!(prefix.prefix(), "2001:db8::".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(p("2001:db8:ffff:ffff::1", 32), p("2001:db8::", 32));
     }
 
     #[test]
@@ -258,7 +315,8 @@ mod tests {
             Ipv4Addr::new(127, 0, 0, 1),
             Ipv4Addr::new(169, 254, 1, 1),
             Ipv4Addr::new(192, 0, 0, 170),
-            Ipv4Addr::new(198, 18, 0, 1),
+            // CLAT address seen on an iPhone on T-Mobile.
+            Ipv4Addr::new(192, 0, 0, 6),
             Ipv4Addr::new(224, 0, 0, 1),
             Ipv4Addr::new(240, 0, 0, 1),
             Ipv4Addr::UNSPECIFIED,
@@ -268,5 +326,51 @@ mod tests {
         }
         // Just outside the shared range.
         assert!(is_translatable(Ipv4Addr::new(100, 128, 0, 1)));
+        // Ranges used as public addresses in network simulations.
+        assert!(is_translatable(Ipv4Addr::new(198, 18, 0, 1)));
+        assert!(is_translatable(Ipv4Addr::new(203, 0, 113, 1)));
+    }
+
+    #[test]
+    fn state_inactive_by_default() {
+        let state = Nat64State::default();
+        let dst = SocketAddrV4::new(Ipv4Addr::new(97, 93, 141, 207), 52966);
+        assert_eq!(state.get(), None);
+        assert_eq!(state.translate_dst(dst), None);
+        let src = SocketAddrV6::new("64:ff9b::615d:8dcf".parse().unwrap(), 52966, 0, 0);
+        assert_eq!(state.untranslate_src(src), None);
+    }
+
+    #[test]
+    fn state_translates_round_trip() {
+        let state = Nat64State::default();
+        state.set(Some(Nat64Prefix::WELL_KNOWN));
+        let dst = SocketAddrV4::new(Ipv4Addr::new(97, 93, 141, 207), 52966);
+        let synth = state.translate_dst(dst).unwrap();
+        assert_eq!(
+            synth.ip(),
+            &"64:ff9b::615d:8dcf".parse::<Ipv6Addr>().unwrap()
+        );
+        assert_eq!(synth.port(), 52966);
+        assert_eq!(state.untranslate_src(synth), Some(dst));
+
+        // Private destinations are not translated (NAT64 would not forward them).
+        let lan = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 50), 1234);
+        assert_eq!(state.translate_dst(lan), None);
+        // Native IPv6 sources are left alone.
+        let native = SocketAddrV6::new("2607:fb90::1".parse().unwrap(), 1234, 0, 0);
+        assert_eq!(state.untranslate_src(native), None);
+
+        state.set(None);
+        assert_eq!(state.translate_dst(dst), None);
+        assert_eq!(state.untranslate_src(synth), None);
+    }
+
+    #[test]
+    fn state_shared_between_clones() {
+        let writer = Nat64State::default();
+        let reader = writer.clone();
+        writer.set(Some(Nat64Prefix::WELL_KNOWN));
+        assert_eq!(reader.get(), Some(Nat64Prefix::WELL_KNOWN));
     }
 }
