@@ -57,6 +57,7 @@ pub(crate) use self::{
 
 mod defaults;
 mod metrics;
+mod nat64;
 mod options;
 mod probes;
 mod report;
