@@ -347,10 +347,7 @@ mod tests {
         state.set(Some(Nat64Prefix::WELL_KNOWN));
         let dst = SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 4433);
         let synth = state.translate_dst(dst).unwrap();
-        assert_eq!(
-            synth.ip(),
-            &"64:ff9b::102:304".parse::<Ipv6Addr>().unwrap()
-        );
+        assert_eq!(synth.ip(), &"64:ff9b::102:304".parse::<Ipv6Addr>().unwrap());
         assert_eq!(synth.port(), 4433);
         assert_eq!(state.untranslate_src(synth), Some(dst));
 
@@ -358,7 +355,7 @@ mod tests {
         let lan = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 50), 1234);
         assert_eq!(state.translate_dst(lan), None);
         // Native IPv6 sources are left alone.
-        let native = SocketAddrV6::new("2607:fb90::1".parse().unwrap(), 1234, 0, 0);
+        let native = SocketAddrV6::new("2001:db8::1".parse().unwrap(), 1234, 0, 0);
         assert_eq!(state.untranslate_src(native), None);
 
         state.set(None);
