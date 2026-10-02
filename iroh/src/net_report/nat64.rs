@@ -239,8 +239,8 @@ mod tests {
 
     #[test]
     fn well_known_prefix() {
-        let synth = Nat64Prefix::WELL_KNOWN.synthesize(Ipv4Addr::new(97, 93, 141, 207));
-        assert_eq!(synth, "64:ff9b::615d:8dcf".parse::<Ipv6Addr>().unwrap());
+        let synth = Nat64Prefix::WELL_KNOWN.synthesize(Ipv4Addr::new(1, 2, 3, 4));
+        assert_eq!(synth, "64:ff9b::102:304".parse::<Ipv6Addr>().unwrap());
     }
 
     #[test]
@@ -304,7 +304,7 @@ mod tests {
 
     #[test]
     fn translatable_addresses() {
-        assert!(is_translatable(Ipv4Addr::new(97, 93, 141, 207)));
+        assert!(is_translatable(Ipv4Addr::new(1, 2, 3, 4)));
         assert!(is_translatable(Ipv4Addr::new(8, 8, 8, 8)));
         for v4 in [
             Ipv4Addr::new(192, 168, 1, 50),
@@ -334,10 +334,10 @@ mod tests {
     #[test]
     fn state_inactive_by_default() {
         let state = Nat64State::default();
-        let dst = SocketAddrV4::new(Ipv4Addr::new(97, 93, 141, 207), 52966);
+        let dst = SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 4433);
         assert_eq!(state.get(), None);
         assert_eq!(state.translate_dst(dst), None);
-        let src = SocketAddrV6::new("64:ff9b::615d:8dcf".parse().unwrap(), 52966, 0, 0);
+        let src = SocketAddrV6::new("64:ff9b::102:304".parse().unwrap(), 4433, 0, 0);
         assert_eq!(state.untranslate_src(src), None);
     }
 
@@ -345,13 +345,13 @@ mod tests {
     fn state_translates_round_trip() {
         let state = Nat64State::default();
         state.set(Some(Nat64Prefix::WELL_KNOWN));
-        let dst = SocketAddrV4::new(Ipv4Addr::new(97, 93, 141, 207), 52966);
+        let dst = SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 4433);
         let synth = state.translate_dst(dst).unwrap();
         assert_eq!(
             synth.ip(),
-            &"64:ff9b::615d:8dcf".parse::<Ipv6Addr>().unwrap()
+            &"64:ff9b::102:304".parse::<Ipv6Addr>().unwrap()
         );
-        assert_eq!(synth.port(), 52966);
+        assert_eq!(synth.port(), 4433);
         assert_eq!(state.untranslate_src(synth), Some(dst));
 
         // Private destinations are not translated (NAT64 would not forward them).
