@@ -141,6 +141,60 @@ fn extract_at(len: u8, octets: &[u8; 16]) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::from(v4))
 }
 
+/// How many consecutive failed IPv4 QAD rounds through a prefix before trying the next one.
+const MAX_FAILURES: u8 = 2;
+
+/// The NAT64 prefixes the network may be using, in order of preference.
+///
+/// Networks announce their prefix in different ways and not every source is right on every
+/// network, so the prefix in use is checked against IPv4 QAD: a prefix that keeps failing is
+/// swapped for the next candidate.
+#[derive(Debug, Default)]
+pub(crate) struct Nat64Candidates {
+    list: Vec<Nat64Prefix>,
+    failures: u8,
+}
+
+impl Nat64Candidates {
+    /// Forgets all candidates.
+    pub(crate) fn clear(&mut self) {
+        self.list.clear();
+        self.failures = 0;
+    }
+
+    /// Replaces the candidates, dropping duplicates, and returns the preferred one.
+    pub(crate) fn set(
+        &mut self,
+        found: impl IntoIterator<Item = Nat64Prefix>,
+    ) -> Option<Nat64Prefix> {
+        self.clear();
+        for prefix in found {
+            if !self.list.contains(&prefix) {
+                self.list.push(prefix);
+            }
+        }
+        self.list.first().copied()
+    }
+
+    /// Records whether IPv4 QAD worked through `current` and returns the prefix to use next.
+    pub(crate) fn verify(&mut self, current: Nat64Prefix, qad_ok: bool) -> Nat64Prefix {
+        if qad_ok {
+            self.failures = 0;
+            return current;
+        }
+        self.failures += 1;
+        if self.failures < MAX_FAILURES || self.list.len() < 2 {
+            return current;
+        }
+        self.failures = 0;
+        let next = match self.list.iter().position(|p| *p == current) {
+            Some(i) => (i + 1) % self.list.len(),
+            None => 0,
+        };
+        self.list[next]
+    }
+}
+
 /// The NAT64 prefix currently used for translation, shared between net_report and the IP
 /// transports.
 #[derive(Debug, Clone, Default)]
@@ -215,6 +269,35 @@ mod tests {
 
     fn p(s: &str, len: u8) -> Nat64Prefix {
         Nat64Prefix::new(s.parse().unwrap(), len).unwrap()
+    }
+
+    #[test]
+    fn candidates_switch_after_repeated_failures() {
+        let nsp = p("2001:db8:122:344::", 96);
+        let mut c = Nat64Candidates::default();
+        assert_eq!(c.set([]), None);
+        assert_eq!(
+            c.set([nsp, Nat64Prefix::WELL_KNOWN, nsp]),
+            Some(nsp),
+            "duplicates are dropped"
+        );
+
+        // A single failure is tolerated, a success resets the count.
+        assert_eq!(c.verify(nsp, false), nsp);
+        assert_eq!(c.verify(nsp, true), nsp);
+        assert_eq!(c.verify(nsp, false), nsp);
+        // The second failure in a row moves on, and wraps around.
+        assert_eq!(c.verify(nsp, false), Nat64Prefix::WELL_KNOWN);
+        assert_eq!(
+            c.verify(Nat64Prefix::WELL_KNOWN, false),
+            Nat64Prefix::WELL_KNOWN
+        );
+        assert_eq!(c.verify(Nat64Prefix::WELL_KNOWN, false), nsp);
+
+        // With a single candidate there is nothing to switch to.
+        c.set([nsp]);
+        assert_eq!(c.verify(nsp, false), nsp);
+        assert_eq!(c.verify(nsp, false), nsp);
     }
 
     /// The table in RFC 6052 §2.4.

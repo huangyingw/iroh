@@ -148,6 +148,9 @@ pub(crate) struct Client {
     /// NAT64 translation state shared with the IP transports.
     #[cfg(not(wasm_browser))]
     nat64: nat64::Nat64State,
+    /// The NAT64 prefixes found on the current network.
+    #[cfg(not(wasm_browser))]
+    nat64_candidates: nat64::Nat64Candidates,
     /// Whether to check for captive portals.
     captive_portal_check: bool,
     /// A collection of previously generated reports.
@@ -292,6 +295,8 @@ impl Client {
             tls_config: opts.tls_config,
             #[cfg(not(wasm_browser))]
             nat64: opts.nat64,
+            #[cfg(not(wasm_browser))]
+            nat64_candidates: Default::default(),
             captive_portal_check: opts.user_config.captive_portal_check,
         }
     }
@@ -312,6 +317,7 @@ impl Client {
         #[cfg(not(wasm_browser))]
         if is_major {
             self.nat64.set(None);
+            self.nat64_candidates.clear();
         }
 
         let mut do_full = is_major
@@ -472,9 +478,11 @@ impl Client {
     ///
     /// Translation is enabled when IPv4 QAD failed while the host has IPv6, and either the
     /// network's DNS64 reveals a NAT64 prefix (RFC 7050), or the host has no IPv4 address
-    /// besides a CLAT one (then the Well-Known Prefix is assumed, e.g. when the resolver in use
-    /// is not the network's). On a dual-stack host without DNS64, a failed IPv4 QAD never
-    /// diverts native IPv4.
+    /// besides a CLAT one (then the Well-Known Prefix is a candidate too). On a dual-stack host
+    /// without DNS64, a failed IPv4 QAD never diverts native IPv4.
+    ///
+    /// The prefix in use is checked by the IPv4 QAD probes, which go through it: if they keep
+    /// failing and another candidate is known, that one is tried instead.
     ///
     /// The host's IPv6 address is used rather than `udp_v6`, because relays may not offer
     /// IPv6 QAD even where IPv6 works.
@@ -487,11 +495,14 @@ impl Client {
 
         let current = self.nat64.get();
         let prefix = match current {
-            Some(prefix) => Some(prefix),
-            None if !report.udp_v4 && native_if_state.have_v6 => self
-                .discover_nat64_prefix()
-                .await
-                .or_else(|| (!native_if_state.have_native_v4).then_some(Nat64Prefix::WELL_KNOWN)),
+            Some(current) => Some(self.nat64_candidates.verify(current, report.udp_v4)),
+            None if !report.udp_v4 && native_if_state.have_v6 => {
+                let mut found = self.discover_nat64_prefixes().await;
+                if !native_if_state.have_native_v4 {
+                    found.push(Nat64Prefix::WELL_KNOWN);
+                }
+                self.nat64_candidates.set(found)
+            }
             None => None,
         }
         .filter(|_| native_if_state.have_v6);
@@ -509,31 +520,61 @@ impl Client {
         report.nat64_prefix = prefix.map(Into::into);
     }
 
-    /// Looks up the NAT64 prefix via the network's DNS64 (RFC 7050).
+    /// Looks up the network's NAT64 prefixes with the RFC 7050 query for `ipv4only.arpa`.
+    ///
+    /// The query only reveals the prefix when it reaches the network's own DNS64. The
+    /// configured resolver may not use the network's nameservers (it falls back to public
+    /// ones where the system configuration can't be read, e.g. on iOS), so the system
+    /// resolver is asked as well, and its answer is preferred.
     #[cfg(not(wasm_browser))]
-    async fn discover_nat64_prefix(&self) -> Option<nat64::Nat64Prefix> {
-        use std::net::IpAddr;
+    async fn discover_nat64_prefixes(&self) -> Vec<nat64::Nat64Prefix> {
+        use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
         use self::defaults::timeouts::DNS_TIMEOUT;
 
-        let answers = match self
-            .socket_state
-            .dns_resolver
-            .lookup_ipv6(nat64::IPV4ONLY_ARPA, DNS_TIMEOUT)
-            .await
-        {
-            Ok(addrs) => addrs
-                .filter_map(|addr| match addr {
-                    IpAddr::V6(addr) => Some(addr),
-                    IpAddr::V4(_) => None,
-                })
-                .collect::<Vec<_>>(),
-            Err(err) => {
-                debug!("NAT64 prefix lookup failed: {err:#}");
-                return None;
+        let system = async {
+            let name = nat64::IPV4ONLY_ARPA.trim_end_matches('.');
+            match time::timeout(DNS_TIMEOUT, tokio::net::lookup_host((name, 0))).await {
+                Ok(Ok(addrs)) => addrs
+                    .filter_map(|addr| match addr {
+                        SocketAddr::V6(addr) => Some(*addr.ip()),
+                        SocketAddr::V4(_) => None,
+                    })
+                    .collect::<Vec<Ipv6Addr>>(),
+                Ok(Err(err)) => {
+                    debug!("NAT64 prefix lookup with the system resolver failed: {err:#}");
+                    Vec::new()
+                }
+                Err(_) => {
+                    debug!("NAT64 prefix lookup with the system resolver timed out");
+                    Vec::new()
+                }
             }
         };
-        nat64::Nat64Prefix::from_ipv4only_arpa(&answers)
+        let configured = async {
+            match self
+                .socket_state
+                .dns_resolver
+                .lookup_ipv6(nat64::IPV4ONLY_ARPA, DNS_TIMEOUT)
+                .await
+            {
+                Ok(addrs) => addrs
+                    .filter_map(|addr| match addr {
+                        IpAddr::V6(addr) => Some(addr),
+                        IpAddr::V4(_) => None,
+                    })
+                    .collect::<Vec<Ipv6Addr>>(),
+                Err(err) => {
+                    debug!("NAT64 prefix lookup failed: {err:#}");
+                    Vec::new()
+                }
+            }
+        };
+        let (system, configured) = tokio::join!(system, configured);
+        [system, configured]
+            .iter()
+            .filter_map(|answers| nat64::Nat64Prefix::from_ipv4only_arpa(answers))
+            .collect()
     }
 
     #[cfg(not(wasm_browser))]
