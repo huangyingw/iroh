@@ -31,7 +31,7 @@ pub use self::{
 use super::Source;
 use crate::{
     address_lookup::{AddressLookupFailed, AddressLookupServices, Item as AddressLookupItem},
-    endpoint::DirectAddr,
+    endpoint::{DirectAddr, DirectAddrType},
     socket::{
         Metrics as SocketMetrics, RELAY_PATH_MAX_IDLE_TIMEOUT,
         mapped_addrs::{AddrMap, CustomMappedAddr, RelayMappedAddr},
@@ -49,6 +49,14 @@ mod remote_info;
 /// If there have been no changes to the NAT address candidates, holepunching will not be
 /// attempted more frequently than at this interval.
 const HOLEPUNCH_ATTEMPTS_INTERVAL: Duration = Duration::from_secs(5);
+/// How many hole punching rounds per remote may spray (see `transports::spray`).
+const MAX_SPRAY_ROUNDS: u32 = 3;
+/// How many random-port candidates a spraying round announces for the remote to probe.
+///
+/// With 256 spray sockets this collides with ~63% per round, ~95% over three rounds.
+const SPRAY_ANNOUNCE: usize = 240;
+/// Lowest announced port: NATs do not hand out system ports as mappings.
+const SPRAY_MIN_PORT: u16 = 1024;
 
 /// The latency at or under which we don't try to upgrade to a better path.
 const GOOD_ENOUGH_LATENCY: Duration = Duration::from_millis(10);
@@ -152,6 +160,14 @@ struct State {
     ///
     /// We only select a path once the path is functional in Noq.
     selected_path: Option<transports::FourTuple>,
+    /// Spray sockets for hole punching through a symmetric NAT (shared with the transports).
+    spray: transports::SprayState,
+    /// The random-port candidates announced for the remote to probe our symmetric NAT.
+    spray_candidates: BTreeSet<SocketAddr>,
+    /// How many hole punching rounds of this remote were sprayed.
+    spray_rounds: u32,
+    /// When, as a server with no direct path, spraying was first considered.
+    spray_server_since: Option<Instant>,
     /// Time at which we should schedule the next holepunch attempt.
     scheduled_holepunch: Option<Instant>,
     /// When to next attempt opening paths in [`Self::pending_open_paths`].
@@ -180,6 +196,7 @@ impl RemoteStateActor {
         metrics: Arc<SocketMetrics>,
         address_lookup: AddressLookupServices,
         path_selector: Arc<dyn PathSelector>,
+        spray: transports::SprayState,
     ) -> Self {
         Self {
             connections: FxHashMap::default(),
@@ -196,6 +213,10 @@ impl RemoteStateActor {
                 paths: RemotePathState::new(metrics),
                 last_holepunch: None,
                 selected_path: Default::default(),
+                spray,
+                spray_candidates: Default::default(),
+                spray_rounds: 0,
+                spray_server_since: None,
                 scheduled_holepunch: None,
                 scheduled_open_path: None,
                 pending_open_paths: VecDeque::new(),
@@ -527,6 +548,15 @@ impl RemoteStateActor {
             .map(|(_, conn)| conn)
         else {
             trace!("not holepunching: no client connection");
+            if let Some(conn) = self
+                .connections
+                .iter()
+                .filter_map(|(id, state)| state.handle.upgrade().map(|conn| (*id, conn)))
+                .min_by_key(|(id, _)| *id)
+                .map(|(_, conn)| conn)
+            {
+                self.state.maybe_spray_as_server(&conn);
+            }
             return;
         };
         let remote_candidates = match conn.get_remote_nat_traversal_addresses() {
@@ -923,6 +953,7 @@ impl State {
     #[instrument(skip_all)]
     fn do_holepunching(&mut self, conn: noq::Connection) {
         self.metrics.holepunch_attempts.inc();
+        self.maybe_spray(&conn);
         let local_candidates = self.local_candidates();
         match conn.initiate_nat_traversal_round() {
             Ok(remote_candidates) => {
@@ -1092,11 +1123,149 @@ impl State {
 
     /// Returns the current set of local direct addresses.
     fn local_candidates(&mut self) -> BTreeSet<SocketAddr> {
-        self.local_direct_addrs
+        let mut candidates: BTreeSet<SocketAddr> = self
+            .local_direct_addrs
             .get()
             .iter()
             .map(|d| d.addr)
-            .collect()
+            .collect();
+        candidates.extend(self.spray_candidates.iter().copied());
+        candidates
+    }
+
+    /// Sprays for a symmetric NAT before a hole punching round, if that is called for.
+    ///
+    /// Spraying is done when net_report found our IPv4 mapping varies by destination, or
+    /// when it could not tell (a single QAD server cannot) and a previous round brought no
+    /// direct path. Each spray creates fresh NAT mappings towards the remote's public
+    /// IPv4 addresses and announces a new set of random ports on our public IPv4 address
+    /// for the remote to probe (see `transports::spray`).
+    fn maybe_spray(&mut self, conn: &noq::Connection) {
+        let targets: Vec<SocketAddr> = match conn.get_remote_nat_traversal_addresses() {
+            Ok(addrs) => addrs.into_iter().filter(|a| a.is_ipv4()).collect(),
+            Err(err) => {
+                debug!("spray: no remote candidates: {err:#}");
+                return;
+            }
+        };
+        let round_failed = self.last_holepunch.is_some();
+        self.spray_for(conn, targets, round_failed);
+    }
+
+    /// The server side's counterpart of [`Self::maybe_spray`].
+    ///
+    /// Only the client side runs hole punching rounds, but a server behind a symmetric
+    /// NAT has to spray too. Its announced ports reach the client as ADD_ADDRESS frames,
+    /// which make the client probe them. The remote's addresses come from what we know of
+    /// it rather than from QNT, and "a round failed" is approximated by the time since we
+    /// first got here with no direct path.
+    fn maybe_spray_as_server(&mut self, conn: &noq::Connection) {
+        let now = Instant::now();
+        let since = *self.spray_server_since.get_or_insert(now);
+        let round_failed = now.duration_since(since) >= HOLEPUNCH_ATTEMPTS_INTERVAL;
+        if !round_failed && self.spray.nat_unknown() {
+            // Come back once the client's first round has had its chance.
+            self.scheduled_holepunch = Some(since + HOLEPUNCH_ATTEMPTS_INTERVAL);
+            return;
+        }
+        let targets: Vec<SocketAddr> = self
+            .paths
+            .addrs()
+            .filter_map(|addr| match addr {
+                transports::Addr::Ip(addr) if addr.is_ipv4() => Some(*addr),
+                _ => None,
+            })
+            .collect();
+        if self.spray_for(conn, targets, round_failed) && self.spray_rounds < MAX_SPRAY_ROUNDS {
+            self.scheduled_holepunch = Some(now + HOLEPUNCH_ATTEMPTS_INTERVAL);
+        }
+    }
+
+    /// Sprays towards `targets` and announces random ports, if that is called for.
+    ///
+    /// Returns whether a spray was done.
+    fn spray_for(
+        &mut self,
+        conn: &noq::Connection,
+        targets: Vec<SocketAddr>,
+        round_failed: bool,
+    ) -> bool {
+        let no_direct_path = !self
+            .selected_path
+            .as_ref()
+            .is_some_and(|p| matches!(p, transports::FourTuple::Ip { .. }));
+        let want = self.spray.should_spray() || (self.spray.nat_unknown() && round_failed);
+        if !want || !no_direct_path || self.spray_rounds >= MAX_SPRAY_ROUNDS {
+            return false;
+        }
+        let Some(public_ip) = self
+            .local_direct_addrs
+            .get()
+            .iter()
+            .find(|d| d.typ == DirectAddrType::Qad && d.addr.is_ipv4())
+            .map(|d| d.addr.ip())
+        else {
+            debug!("spray: no public IPv4 address of our own known");
+            return false;
+        };
+        if targets.is_empty() {
+            debug!("spray: remote has no IPv4 candidates");
+            return false;
+        }
+        let sprayed = self.spray.spray(&targets);
+        if sprayed == 0 {
+            return false;
+        }
+        self.spray_rounds += 1;
+
+        // Fresh random ports every round: drop last round's announcement first.
+        for addr in std::mem::take(&mut self.spray_candidates) {
+            if let Err(err) = conn.remove_nat_traversal_address(addr) {
+                debug!(%addr, "spray: removing old candidate: {err:#}");
+            }
+        }
+        let known: BTreeSet<u16> = self
+            .local_direct_addrs
+            .get()
+            .iter()
+            .filter(|d| d.addr.ip() == public_ip)
+            .map(|d| d.addr.port())
+            .collect();
+        let mut rng = rand::rng();
+        use rand::RngExt as _;
+        let mut announced = 0;
+        let mut tries = 0;
+        while announced < SPRAY_ANNOUNCE && tries < SPRAY_ANNOUNCE * 4 {
+            tries += 1;
+            let port: u16 = rng.random_range(SPRAY_MIN_PORT..=u16::MAX);
+            if known.contains(&port) {
+                continue;
+            }
+            let addr = SocketAddr::new(public_ip, port);
+            if !self.spray_candidates.insert(addr) {
+                continue;
+            }
+            match conn.add_nat_traversal_address(addr) {
+                Ok(_) => announced += 1,
+                Err(err) => {
+                    self.spray_candidates.remove(&addr);
+                    debug!(
+                        announced,
+                        "spray: remote accepts no more candidates: {err:#}"
+                    );
+                    break;
+                }
+            }
+        }
+        event!(
+            target: "iroh::_events::qnt::spray",
+            Level::DEBUG,
+            remote = %self.endpoint_id.fmt_short(),
+            sprayed,
+            announced,
+            round = self.spray_rounds,
+        );
+        true
     }
 }
 

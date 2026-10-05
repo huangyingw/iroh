@@ -142,7 +142,10 @@ pub(crate) const MAX_MULTIPATH_PATHS: u32 = 8;
 /// interfaces enabled. We've seen MacOS machines with >25 interfaces in the wild
 /// (mostly due to VPN TUN and docket interfaces), so this seems like a reasonable
 /// value.
-pub(crate) const MAX_QNT_ADDRESSES: u8 = 32;
+///
+/// Also the room for the random-port candidates announced when hole punching through a
+/// symmetric NAT (see `transports::spray`), so this is the protocol maximum.
+pub(crate) const MAX_QNT_ADDRESSES: u8 = 255;
 
 /// Error returned when the endpoint state actor stopped while waiting for a reply.
 #[stack_error(add_meta, derive)]
@@ -946,6 +949,10 @@ impl EndpointInner {
         .map_err(|err| e!(BindError::Sockets, err))?;
         #[cfg(not(wasm_browser))]
         let nat64_state = transports.nat64_state();
+        #[cfg(not(wasm_browser))]
+        let spray_state = transports.spray_state();
+        #[cfg(wasm_browser)]
+        let spray_state = transports::SprayState::default();
 
         if let Some(v4_port) = transports.local_addrs().into_iter().find_map(|t| {
             if let transports::Addr::Ip(SocketAddr::V4(addr)) = t {
@@ -983,6 +990,7 @@ impl EndpointInner {
                 address_lookup.clone(),
                 shutdown_token.child_token(),
                 path_selector,
+                spray_state.clone(),
                 span.clone(),
             )
         };
@@ -1092,6 +1100,7 @@ impl EndpointInner {
             local_interfaces_watcher,
             direct_addr_update_state,
             transports_network_change,
+            spray_state,
             direct_addr_done_rx,
             call_notify_quic_network_change: None,
         };
@@ -1473,6 +1482,8 @@ struct Actor {
     /// Watcher for changes to the local network interfaces, IP addresses and routes.
     local_interfaces_watcher: n0_watcher::Direct<netmon::State>,
     transports_network_change: transports::NetworkChangeSender,
+    /// Spray sockets for hole punching through a symmetric NAT; told the NAT type here.
+    spray_state: transports::SprayState,
     /// Indicates the direct addr update state.
     direct_addr_update_state: DirectAddrUpdateState,
     direct_addr_done_rx: mpsc::Receiver<()>,
@@ -1983,6 +1994,8 @@ impl Actor {
 
             // Notify all transports
             self.transports_network_change.on_network_change(r);
+            self.spray_state
+                .set_mapping_varies_by_dest(r.mapping_varies_by_dest_ipv4);
         }
 
         #[cfg(not(wasm_browser))]

@@ -13,7 +13,7 @@ use netwatch::{UdpSender, UdpSocket};
 use pin_project::pin_project;
 use tracing::{debug, info, trace};
 
-use super::{RecvInfo, Transmit};
+use super::{RecvInfo, Transmit, spray::SprayState};
 use crate::{
     metrics::{EndpointMetrics, SocketMetrics},
     net_report::nat64::Nat64State,
@@ -379,11 +379,16 @@ pub(super) struct IpTransportsSender {
     v6: Vec<IpSender>,
     default_v6_index: Option<usize>,
     nat64: Nat64State,
+    spray: SprayState,
 }
 
 impl IpTransportsSender {
     pub(super) fn nat64(&self) -> &Nat64State {
         &self.nat64
+    }
+
+    pub(super) fn spray(&self) -> &SprayState {
+        &self.spray
     }
 
     pub(super) fn v4_iter_mut(&mut self) -> impl Iterator<Item = &mut IpSender> {
@@ -416,6 +421,7 @@ pub(super) struct IpTransports {
     v6: Vec<IpTransport>,
     default_v6_index: Option<usize>,
     nat64: Nat64State,
+    spray: SprayState,
 }
 
 impl IpTransports {
@@ -429,12 +435,18 @@ impl IpTransports {
             v6: ip_v6,
             default_v6_index: self.default_v6_index,
             nat64: self.nat64.clone(),
+            spray: self.spray.clone(),
         }
     }
 
     /// The NAT64 state shared by these transports, to be driven by net_report.
     pub(super) fn nat64(&self) -> &Nat64State {
         &self.nat64
+    }
+
+    /// The spray sockets for hole punching through a symmetric NAT.
+    pub(super) fn spray(&self) -> &SprayState {
+        &self.spray
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = &IpTransport> {
@@ -499,6 +511,7 @@ impl IpTransports {
             v6: ip_v6,
             default_v6_index,
             nat64,
+            spray: SprayState::default(),
         })
     }
 

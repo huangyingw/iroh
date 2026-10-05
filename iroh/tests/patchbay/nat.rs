@@ -14,6 +14,11 @@
 //!
 //! Every test expects a direct path to be established. Tests where holepunching
 //! is not yet working are marked `#[ignore]`.
+//!
+//! `Strict` against `Moderate` is punched with the birthday-paradox spray (see
+//! `socket::transports::spray`). With a single relay the NAT type is unknown, so the
+//! spray only starts after the first round failed, and each round has a ~63% chance:
+//! these tests get a longer timeout.
 
 use std::time::Duration;
 
@@ -41,7 +46,11 @@ async fn run_nat_holepunch(nat_server: Nat, nat_client: Nat) -> Result {
         .build()
         .await?;
 
-    let timeout = Duration::from_secs(15);
+    let timeout = if nat_server == Nat::Strict || nat_client == Nat::Strict {
+        Duration::from_secs(40)
+    } else {
+        Duration::from_secs(15)
+    };
     Pair::new(relay_map)
         .server(server, async move |_dev, _ep, conn| {
             assert!(is_relayed(&conn), "connection started relayed");
@@ -140,7 +149,6 @@ async fn nat_moderate_x_moderate() -> Result {
 
 #[tokio::test]
 #[traced_test]
-#[ignore = "not yet passing (and likely can't without port guessing)"]
 async fn nat_moderate_x_strict() -> Result {
     run_nat_holepunch(Nat::Moderate, Nat::Strict).await
 }
@@ -161,7 +169,6 @@ async fn nat_strict_x_open() -> Result {
 
 #[tokio::test]
 #[traced_test]
-#[ignore = "not yet passing (and likely can't without port guessing)"]
 async fn nat_strict_x_moderate() -> Result {
     run_nat_holepunch(Nat::Strict, Nat::Moderate).await
 }

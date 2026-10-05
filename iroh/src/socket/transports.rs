@@ -31,6 +31,7 @@ pub(crate) mod custom;
 #[cfg(not(wasm_browser))]
 mod ip;
 mod relay;
+mod spray;
 
 use custom::{CustomEndpoint, CustomSender, CustomTransport};
 
@@ -41,6 +42,7 @@ use self::ip::{IpNetworkChangeSender, IpTransports, IpTransportsSender};
 pub(crate) use self::relay::{
     HomeRelayWatch, RelayActorConfig, RelayConnectionState, RelayTransport,
 };
+pub(crate) use self::spray::SprayState;
 
 /// How many times all transports may error on `poll_recv` before we give up.
 ///
@@ -315,6 +317,22 @@ impl Transports {
             };
         }
 
+        // Spray sockets first: a probe landing on one of them is what the whole spray was
+        // for, and there are no spray sockets at all unless a spray is in progress.
+        #[cfg(not(wasm_browser))]
+        match self
+            .ip
+            .spray()
+            .poll_recv(cx, bufs, metas, &mut self.recv_infos)
+        {
+            Poll::Pending => {}
+            Poll::Ready(Ok(n)) => {
+                self.consecutive_total_recv_failures = 0;
+                return Poll::Ready(Ok(n));
+            }
+            Poll::Ready(Err(err)) => debug!("spray recv error: {err:#}"),
+        }
+
         // To improve fairness, every other call reverses the ordering of polling.
         self.poll_recv_counter = self.poll_recv_counter.wrapping_add(1);
         let counter = self.poll_recv_counter;
@@ -373,6 +391,12 @@ impl Transports {
     #[cfg(not(wasm_browser))]
     pub(crate) fn nat64_state(&self) -> crate::net_report::nat64::Nat64State {
         self.ip.nat64().clone()
+    }
+
+    /// The spray state for hole punching through a symmetric NAT.
+    #[cfg(not(wasm_browser))]
+    pub(crate) fn spray_state(&self) -> SprayState {
+        self.ip.spray().clone()
     }
 
     /// Returns a list of all currently known local addresses.
@@ -1187,6 +1211,18 @@ impl TransportsSender {
                 local: src,
             } => match dst_addr {
                 SocketAddr::V4(dst_v4) => {
+                    // A remote that reached us through a spray socket is only reachable
+                    // through that socket's NAT mapping.
+                    if let Some(socket) = self.ip.spray().pinned(*dst_addr) {
+                        let transmit = noq_udp::Transmit {
+                            destination: SocketAddr::V4(*dst_v4),
+                            ecn: transmit.ecn,
+                            contents: transmit.contents,
+                            segment_size: transmit.segment_size,
+                            src_ip: None,
+                        };
+                        return socket.poll_send_noq(cx, &transmit);
+                    }
                     // On an IPv6-only network with NAT64, IPv4 destinations are reached by
                     // sending to their synthesized IPv6 address from an IPv6 socket.
                     if let Some(dst_v6) = self.ip.nat64().translate_dst(*dst_v4) {
