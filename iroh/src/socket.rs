@@ -1944,6 +1944,13 @@ impl Actor {
             }
 
             for ip in ips {
+                if let IpAddr::V4(v4) = ip
+                    && net_report::nat64::is_clat_internal(v4)
+                {
+                    // The CLAT's own 192.0.0.0/29 address (RFC 7335) only exists inside
+                    // this host; remotes can't reach it.
+                    continue;
+                }
                 let port_if_unspecified = match ip {
                     IpAddr::V4(_) => has_ipv4_unspecified,
                     IpAddr::V6(_) => has_ipv6_unspecified,

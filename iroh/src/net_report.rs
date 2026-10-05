@@ -571,10 +571,14 @@ impl Client {
             }
         };
         let (system, configured) = tokio::join!(system, configured);
-        [system, configured]
-            .iter()
-            .filter_map(|answers| nat64::Nat64Prefix::from_ipv4only_arpa(answers))
-            .collect()
+        let system = nat64::Nat64Prefix::from_ipv4only_arpa(&system);
+        let configured = nat64::Nat64Prefix::from_ipv4only_arpa(&configured);
+        info!(
+            system_resolver = ?system.map(|p| ipnet::Ipv6Net::from(p).to_string()),
+            configured_resolver = ?configured.map(|p| ipnet::Ipv6Net::from(p).to_string()),
+            "NAT64 prefix discovery (ipv4only.arpa) finished"
+        );
+        [system, configured].into_iter().flatten().collect()
     }
 
     #[cfg(not(wasm_browser))]

@@ -104,8 +104,7 @@ impl From<netwatch::netmon::State> for IfStateDetails {
             .flat_map(|iface| iface.addrs())
             .any(|prefix| match prefix.addr() {
                 std::net::IpAddr::V4(v4) => {
-                    let [a, b, c, d] = v4.octets();
-                    !v4.is_loopback() && !(a == 192 && b == 0 && c == 0 && d < 8)
+                    !v4.is_loopback() && !super::nat64::is_clat_internal(v4)
                 }
                 std::net::IpAddr::V6(_) => false,
             });

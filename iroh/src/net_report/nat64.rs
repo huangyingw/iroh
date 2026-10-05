@@ -261,6 +261,18 @@ pub(crate) fn is_translatable(v4: Ipv4Addr) -> bool {
         || (a == 192 && b == 0 && c == 0)) // 192.0.0.0/24 IETF protocol assignments
 }
 
+/// Whether a local IPv4 address belongs to the IPv4 Service Continuity Prefix `192.0.0.0/29`
+/// (RFC 7335), which a 464XLAT host assigns to its own CLAT interface.
+///
+/// Such an address only exists inside the host doing the translation: iOS puts `192.0.0.2`
+/// on the cellular interface while the CLAT is active (and `192.0.0.6` is seen on another
+/// interface even without it). It is neither reachable from a remote nor a sign of native
+/// IPv4 connectivity, so it must not be advertised as a direct address nor counted as IPv4.
+pub(crate) fn is_clat_internal(v4: Ipv4Addr) -> bool {
+    let [a, b, c, d] = v4.octets();
+    a == 192 && b == 0 && c == 0 && d < 8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +395,20 @@ mod tests {
         let answers = ["2606:4700::6810:84e5".parse().unwrap()];
         assert_eq!(Nat64Prefix::from_ipv4only_arpa(&answers), None);
         assert_eq!(Nat64Prefix::from_ipv4only_arpa(&[]), None);
+    }
+
+    #[test]
+    fn clat_internal_range() {
+        for d in 0..8 {
+            assert!(is_clat_internal(Ipv4Addr::new(192, 0, 0, d)), "192.0.0.{d}");
+        }
+        assert!(!is_clat_internal(Ipv4Addr::new(192, 0, 0, 8)));
+        assert!(
+            !is_clat_internal(Ipv4Addr::new(192, 0, 0, 170)),
+            "ipv4only.arpa is not CLAT"
+        );
+        assert!(!is_clat_internal(Ipv4Addr::new(192, 0, 2, 1)));
+        assert!(!is_clat_internal(Ipv4Addr::new(192, 168, 0, 2)));
     }
 
     #[test]
