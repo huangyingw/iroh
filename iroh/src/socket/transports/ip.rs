@@ -13,7 +13,10 @@ use netwatch::{UdpSender, UdpSocket};
 use pin_project::pin_project;
 use tracing::{debug, info, trace};
 
-use super::{RecvInfo, Transmit, spray::SprayState};
+use super::{
+    RecvInfo, Transmit,
+    spray::{HolePunchSprayConfig, SprayState},
+};
 use crate::{
     metrics::{EndpointMetrics, SocketMetrics},
     net_report::nat64::Nat64State,
@@ -460,9 +463,10 @@ impl IpTransports {
     pub(super) fn bind(
         configs: impl Iterator<Item = Config>,
         metrics: &EndpointMetrics,
+        holepunch_spray: HolePunchSprayConfig,
     ) -> io::Result<Self> {
         let nat64 = Nat64State::default();
-        let spray = SprayState::default();
+        let spray = SprayState::new(holepunch_spray);
         let mut has_v4_default = false;
         let mut ip_v4 = Vec::new();
 
@@ -577,7 +581,7 @@ mod tests {
             },
         ];
 
-        let transports = IpTransports::bind(config.into_iter(), &metrics)?;
+        let transports = IpTransports::bind(config.into_iter(), &metrics, Default::default())?;
         assert_eq!(transports.v4[0].config.prefix_len(), 24);
         assert_eq!(transports.v4[1].config.prefix_len(), 8);
         assert_eq!(transports.v4[2].config.prefix_len(), 0);

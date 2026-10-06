@@ -193,6 +193,8 @@ pub(crate) struct Options {
     pub(crate) path_selector: Arc<dyn PathSelector>,
     pub(crate) portmapper_config: portmapper::PortmapperConfig,
     pub(crate) net_report_config: crate::net_report::NetReportConfig,
+    /// Hole punching through a symmetric NAT by spraying.
+    pub(crate) holepunch_spray: transports::HolePunchSprayConfig,
 
     /// Static configuration for the endpoint.
     pub(crate) static_config: StaticConfig,
@@ -894,6 +896,7 @@ impl EndpointInner {
             path_selector,
             portmapper_config,
             net_report_config,
+            holepunch_spray,
             static_config,
             configured_addrs,
         } = opts;
@@ -945,6 +948,7 @@ impl EndpointInner {
             relay_actor_config,
             &metrics,
             shutdown_token.child_token(),
+            holepunch_spray,
         )
         .map_err(|err| e!(BindError::Sockets, err))?;
         #[cfg(not(wasm_browser))]
@@ -2206,6 +2210,7 @@ mod tests {
             path_selector: Arc::new(BiasedRttPathSelector::default()),
             portmapper_config: Default::default(),
             net_report_config: Default::default(),
+            holepunch_spray: Default::default(),
             static_config,
             configured_addrs: Default::default(),
         }
@@ -2622,6 +2627,7 @@ mod tests {
             path_selector: Arc::new(BiasedRttPathSelector::default()),
             portmapper_config: Default::default(),
             net_report_config: Default::default(),
+            holepunch_spray: Default::default(),
             static_config,
             configured_addrs: Default::default(),
         };

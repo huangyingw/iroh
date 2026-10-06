@@ -43,6 +43,7 @@ pub(crate) use self::relay::{
     HomeRelayWatch, RelayActorConfig, RelayConnectionState, RelayTransport,
 };
 pub(crate) use self::spray::SprayState;
+pub use self::spray::{HolePunchSpray, HolePunchSprayConfig};
 
 /// How many times all transports may error on `poll_recv` before we give up.
 ///
@@ -190,11 +191,13 @@ impl TransportConfig {
 
 impl Transports {
     /// Binds the  transports.
+    #[cfg_attr(wasm_browser, allow(unused_variables))]
     pub(crate) fn bind(
         configs: &[TransportConfig],
         relay_actor_config: RelayActorConfig,
         metrics: &EndpointMetrics,
         shutdown_token: CancellationToken,
+        holepunch_spray: HolePunchSprayConfig,
     ) -> io::Result<Self> {
         #[cfg(not(wasm_browser))]
         let ip_configs = {
@@ -225,7 +228,7 @@ impl Transports {
             ip_configs
         };
         #[cfg(not(wasm_browser))]
-        let ip = IpTransports::bind(ip_configs.into_iter(), metrics)?;
+        let ip = IpTransports::bind(ip_configs.into_iter(), metrics, holepunch_spray)?;
 
         let relay = configs
             .iter()
@@ -585,7 +588,7 @@ mod tests {
         let metrics = EndpointMetrics::default();
         Transports {
             #[cfg(not(wasm_browser))]
-            ip: ip::IpTransports::bind(std::iter::empty(), &metrics).unwrap(),
+            ip: ip::IpTransports::bind(std::iter::empty(), &metrics, Default::default()).unwrap(),
             relay: Vec::new(),
             custom,
             poll_recv_counter: 0,

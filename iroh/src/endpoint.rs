@@ -117,7 +117,11 @@ pub use self::{
 #[cfg(not(wasm_browser))]
 use crate::socket::transports::IpConfig;
 use crate::socket::transports::TransportConfig;
-pub use crate::{net_report::NetReportConfig, portmapper::PortmapperConfig};
+pub use crate::{
+    net_report::NetReportConfig,
+    portmapper::PortmapperConfig,
+    socket::transports::{HolePunchSpray, HolePunchSprayConfig},
+};
 
 /// Builder for [`Endpoint`].
 ///
@@ -146,6 +150,7 @@ pub struct Builder {
     path_selector: Arc<dyn PathSelector>,
     portmapper_config: PortmapperConfig,
     net_report_config: NetReportConfig,
+    holepunch_spray: HolePunchSprayConfig,
     crypto_provider: Option<Arc<rustls::crypto::CryptoProvider>>,
     configured_addrs: BTreeSet<SocketAddr>,
 }
@@ -214,6 +219,7 @@ impl Builder {
             path_selector: Arc::new(BiasedRttPathSelector::default()),
             portmapper_config: Default::default(),
             net_report_config: Default::default(),
+            holepunch_spray: Default::default(),
             crypto_provider: None,
             configured_addrs: Default::default(),
         }
@@ -277,6 +283,7 @@ impl Builder {
             path_selector: self.path_selector,
             portmapper_config: self.portmapper_config,
             net_report_config: self.net_report_config,
+            holepunch_spray: self.holepunch_spray,
             static_config,
             configured_addrs: self.configured_addrs,
         };
@@ -797,6 +804,17 @@ impl Builder {
     /// Some non-essential features of the net report component can be disabled via this configuration.
     pub fn net_report_config(mut self, config: NetReportConfig) -> Self {
         self.net_report_config = config;
+        self
+    }
+
+    /// Configures hole punching through a symmetric NAT by spraying extra sockets.
+    ///
+    /// Defaults to [`HolePunchSprayConfig::default`], which follows the `IROH_HOLEPUNCH_SPRAY`
+    /// and `IROH_HOLEPUNCH_SPRAY_SOCKETS` environment variables and is off when they are
+    /// unset. Applications that cannot set environment variables (mobile apps) turn spraying
+    /// on here.
+    pub fn holepunch_spray(mut self, config: HolePunchSprayConfig) -> Self {
+        self.holepunch_spray = config;
         self
     }
 
