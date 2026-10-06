@@ -26,6 +26,7 @@ pub(crate) struct IpTransport {
     local_addr: Watchable<SocketAddr>,
     metrics: Arc<SocketMetrics>,
     nat64: Nat64State,
+    spray: SprayState,
 }
 
 impl std::fmt::Display for IpTransport {
@@ -176,6 +177,7 @@ impl IpTransport {
         config: Config,
         metrics: Arc<SocketMetrics>,
         nat64: Nat64State,
+        spray: SprayState,
     ) -> io::Result<Self> {
         let addr: SocketAddr = config.into();
         debug!(?addr, "binding");
@@ -194,6 +196,7 @@ impl IpTransport {
             local_addr,
             metrics,
             nat64,
+            spray,
         })
     }
 
@@ -236,9 +239,10 @@ impl IpTransport {
                     }
                     // The transport addresses are internal to iroh and we always want those
                     // to remain the canonical address.
-                    *recv_info = RecvInfo::from_addr(
-                        SocketAddr::new(meta.addr.ip().to_canonical(), meta.addr.port()).into(),
-                    );
+                    let remote = SocketAddr::new(meta.addr.ip().to_canonical(), meta.addr.port());
+                    // Heard from on a regular socket: no need to route through a spray one.
+                    self.spray.unpin(remote);
+                    *recv_info = RecvInfo::from_addr(remote.into());
                 }
                 Poll::Ready(Ok(n))
             }
@@ -458,6 +462,7 @@ impl IpTransports {
         metrics: &EndpointMetrics,
     ) -> io::Result<Self> {
         let nat64 = Nat64State::default();
+        let spray = SprayState::default();
         let mut has_v4_default = false;
         let mut ip_v4 = Vec::new();
 
@@ -465,7 +470,7 @@ impl IpTransports {
         let mut ip_v6 = Vec::new();
 
         for config in configs {
-            match IpTransport::bind(config, metrics.socket.clone(), nat64.clone()) {
+            match IpTransport::bind(config, metrics.socket.clone(), nat64.clone(), spray.clone()) {
                 Ok(transport) => {
                     if config.is_ipv4() {
                         if config.is_default() {
@@ -511,7 +516,7 @@ impl IpTransports {
             v6: ip_v6,
             default_v6_index,
             nat64,
-            spray: SprayState::default(),
+            spray,
         })
     }
 

@@ -49,11 +49,14 @@ mod remote_info;
 /// If there have been no changes to the NAT address candidates, holepunching will not be
 /// attempted more frequently than at this interval.
 const HOLEPUNCH_ATTEMPTS_INTERVAL: Duration = Duration::from_secs(5);
+/// How long to wait after a QNT address event before hole punching, so that a burst of
+/// events ends up in one round.
+const ADDR_EVENT_DEBOUNCE: Duration = Duration::from_millis(100);
 /// How many hole punching rounds per remote may spray (see `transports::spray`).
-const MAX_SPRAY_ROUNDS: u32 = 3;
+const MAX_SPRAY_ROUNDS: u32 = 4;
 /// How many random-port candidates a spraying round announces for the remote to probe.
 ///
-/// With 256 spray sockets this collides with ~63% per round, ~95% over three rounds.
+/// With 256 spray sockets this collides with ~63% per round, ~98% over four rounds.
 const SPRAY_ANNOUNCE: usize = 240;
 /// Lowest announced port: NATs do not hand out system ports as mappings.
 const SPRAY_MIN_PORT: u16 = 1024;
@@ -168,6 +171,12 @@ struct State {
     spray_rounds: u32,
     /// When, as a server with no direct path, spraying was first considered.
     spray_server_since: Option<Instant>,
+    /// Addresses the remote announced in QNT frames (ADD_ADDRESS or REACH_OUT).
+    ///
+    /// The server side has no other way to learn where a client is reachable.
+    remote_announced: Vec<SocketAddr>,
+    /// When this remote was last sprayed for.
+    last_spray: Option<Instant>,
     /// Time at which we should schedule the next holepunch attempt.
     scheduled_holepunch: Option<Instant>,
     /// When to next attempt opening paths in [`Self::pending_open_paths`].
@@ -217,6 +226,8 @@ impl RemoteStateActor {
                 spray_candidates: Default::default(),
                 spray_rounds: 0,
                 spray_server_since: None,
+                remote_announced: Default::default(),
+                last_spray: None,
                 scheduled_holepunch: None,
                 scheduled_open_path: None,
                 pending_open_paths: VecDeque::new(),
@@ -308,7 +319,25 @@ impl RemoteStateActor {
                 }
                 Some((id, evt)) = self.state.addr_events.next() => {
                     trace!(?id, ?evt, "remote addrs updated, triggering holepunching");
-                    self.trigger_holepunching();
+                    match evt {
+                        Ok(n0_nat_traversal::Event::AddressAdded(addr)) => {
+                            if !self.state.remote_announced.contains(&addr) {
+                                self.state.remote_announced.push(addr);
+                            }
+                        }
+                        Ok(n0_nat_traversal::Event::AddressRemoved(addr)) => {
+                            self.state.remote_announced.retain(|a| *a != addr);
+                        }
+                        Err(_) => {}
+                    }
+                    // Candidates arrive in bursts (a spraying remote announces hundreds at
+                    // once, and the channel may lag): coalesce them into one round.
+                    let when = Instant::now() + ADDR_EVENT_DEBOUNCE;
+                    self.state.scheduled_holepunch = Some(
+                        self.state
+                            .scheduled_holepunch
+                            .map_or(when, |scheduled| scheduled.min(when)),
+                    );
                 }
                 Some((conn_id, closed)) = self.state.connections_close.next(), if !self.state.connections_close.is_empty() => {
                     self.handle_connection_close(conn_id, closed);
@@ -1141,8 +1170,10 @@ impl State {
     /// IPv4 addresses and announces a new set of random ports on our public IPv4 address
     /// for the remote to probe (see `transports::spray`).
     fn maybe_spray(&mut self, conn: &noq::Connection) {
-        let targets: Vec<SocketAddr> = match conn.get_remote_nat_traversal_addresses() {
-            Ok(addrs) => addrs.into_iter().filter(|a| a.is_ipv4()).collect(),
+        // Announcement order matters (see `spray_targets`); noq's candidate set has none,
+        // so it only fills in what the events did not deliver.
+        let targets = match conn.get_remote_nat_traversal_addresses() {
+            Ok(addrs) => spray_targets(self.remote_announced.iter().copied().chain(addrs)),
             Err(err) => {
                 debug!("spray: no remote candidates: {err:#}");
                 return;
@@ -1156,9 +1187,10 @@ impl State {
     ///
     /// Only the client side runs hole punching rounds, but a server behind a symmetric
     /// NAT has to spray too. Its announced ports reach the client as ADD_ADDRESS frames,
-    /// which make the client probe them. The remote's addresses come from what we know of
-    /// it rather than from QNT, and "a round failed" is approximated by the time since we
-    /// first got here with no direct path.
+    /// which make the client probe them. The client's addresses are those it announced in
+    /// REACH_OUT frames (surfaced as events by noq) plus whatever else we know of it, and
+    /// "a round failed" is approximated by the time since we first got here with no direct
+    /// path.
     fn maybe_spray_as_server(&mut self, conn: &noq::Connection) {
         let now = Instant::now();
         let since = *self.spray_server_since.get_or_insert(now);
@@ -1168,14 +1200,22 @@ impl State {
             self.scheduled_holepunch = Some(since + HOLEPUNCH_ATTEMPTS_INTERVAL);
             return;
         }
-        let targets: Vec<SocketAddr> = self
-            .paths
-            .addrs()
-            .filter_map(|addr| match addr {
-                transports::Addr::Ip(addr) if addr.is_ipv4() => Some(*addr),
-                _ => None,
-            })
-            .collect();
+        if let Some(last) = self.last_spray
+            && now.duration_since(last) < HOLEPUNCH_ATTEMPTS_INTERVAL
+        {
+            // The client's REACH_OUT frames arrive one by one; one spray per round.
+            self.scheduled_holepunch = Some(last + HOLEPUNCH_ATTEMPTS_INTERVAL);
+            return;
+        }
+        let targets = spray_targets(
+            self.paths
+                .addrs()
+                .filter_map(|addr| match addr {
+                    transports::Addr::Ip(addr) => Some(*addr),
+                    _ => None,
+                })
+                .chain(self.remote_announced.iter().copied()),
+        );
         if self.spray_for(conn, targets, round_failed) && self.spray_rounds < MAX_SPRAY_ROUNDS {
             self.scheduled_holepunch = Some(now + HOLEPUNCH_ATTEMPTS_INTERVAL);
         }
@@ -1198,6 +1238,12 @@ impl State {
         if !want || !no_direct_path || self.spray_rounds >= MAX_SPRAY_ROUNDS {
             return false;
         }
+        let now = Instant::now();
+        if let Some(last) = self.last_spray
+            && now.duration_since(last) < HOLEPUNCH_ATTEMPTS_INTERVAL
+        {
+            return false;
+        }
         let Some(public_ip) = self
             .local_direct_addrs
             .get()
@@ -1217,6 +1263,7 @@ impl State {
             return false;
         }
         self.spray_rounds += 1;
+        self.last_spray = Some(now);
 
         // Fresh random ports every round: drop last round's announcement first.
         for addr in std::mem::take(&mut self.spray_candidates) {
@@ -1267,6 +1314,34 @@ impl State {
         );
         true
     }
+}
+
+/// Picks the addresses to spray towards from what the remote announced, in announcement
+/// order.
+///
+/// IPv4 only. A remote that is spraying itself announces hundreds of random ports on its
+/// public IP; its real candidates come first, so at most two ports per IP are kept, and a
+/// few addresses in total: every target costs a NAT mapping per spray socket.
+fn spray_targets(addrs: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
+    const PER_IP: usize = 2;
+    const TOTAL: usize = 6;
+    let mut per_ip: std::collections::BTreeMap<std::net::IpAddr, usize> = Default::default();
+    let mut out = Vec::new();
+    for addr in addrs {
+        if !addr.is_ipv4() || out.contains(&addr) {
+            continue;
+        }
+        let n = per_ip.entry(addr.ip()).or_default();
+        if *n >= PER_IP {
+            continue;
+        }
+        *n += 1;
+        out.push(addr);
+        if out.len() >= TOTAL {
+            break;
+        }
+    }
+    out
 }
 
 /// Updates QNT's candidate addresses to be the current set of direct addresses.

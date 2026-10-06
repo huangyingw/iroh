@@ -521,6 +521,8 @@ impl Transports {
                 .iter()
                 .map(|t| t.create_network_change_sender())
                 .collect(),
+            #[cfg(not(wasm_browser))]
+            spray: self.ip.spray().clone(),
             relay: self
                 .relay
                 .iter()
@@ -689,6 +691,8 @@ mod tests {
 pub(crate) struct NetworkChangeSender {
     #[cfg(not(wasm_browser))]
     ip: Vec<IpNetworkChangeSender>,
+    #[cfg(not(wasm_browser))]
+    spray: SprayState,
     relay: Vec<RelayNetworkChangeSender>,
 }
 
@@ -717,6 +721,8 @@ impl NetworkChangeSender {
     pub(crate) fn rebind(&self) -> std::io::Result<()> {
         let mut res = Ok(());
 
+        #[cfg(not(wasm_browser))]
+        self.spray.clear();
         #[cfg(not(wasm_browser))]
         for transport in &self.ip {
             if let Err(err) = transport.rebind() {

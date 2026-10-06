@@ -282,15 +282,11 @@ async fn run_hard_nat_to_holepunchable(replug_side: Side) -> Result {
                 .await
                 .context("ping 1 (relay)")?;
 
+            // Upstream asserts the connection is still relayed here. With the
+            // birthday-paradox spray (socket/transports/spray.rs) a symmetric NAT against a
+            // moderate one is punched most of the time, so the path may well be direct
+            // already; what matters is that the replug below ends up direct and working.
             tokio::time::sleep(Duration::from_secs(3)).await;
-            assert!(
-                conn.paths()
-                    .iter()
-                    .find(|p| p.is_selected())
-                    .expect("no selected path")
-                    .is_relay(),
-                "should still be relayed behind symmetric NAT"
-            );
 
             info!("replug to holepunchable NAT");
             dev.iface("eth0").unwrap().replug(nat_easy.id()).await?;

@@ -35,7 +35,7 @@ use super::RecvInfo;
 /// Number of extra sockets to spray from.
 pub(crate) const SPRAY_SOCKETS: usize = 256;
 /// How long unpinned spray sockets are kept after a spray, for the remote's probes to land.
-const SPRAY_TTL: Duration = Duration::from_secs(15);
+const SPRAY_TTL: Duration = Duration::from_secs(8);
 /// A pinned socket is released after this long without receiving anything.
 const PINNED_IDLE: Duration = Duration::from_secs(90);
 /// What a spray datagram contains. Too short to be mistaken for a QUIC packet, long enough
@@ -203,6 +203,43 @@ impl SprayState {
             .store(!sockets.list.is_empty(), Ordering::Release);
         debug!(count, "sprayed");
         count
+    }
+
+    /// Drops all spray sockets and pins, e.g. on a network change: their NAT mappings are
+    /// gone with it.
+    pub(crate) fn clear(&self) {
+        let mut sockets = self.0.sockets.lock().expect("poisoned");
+        if !sockets.list.is_empty() {
+            debug!(
+                sockets = sockets.list.len(),
+                pinned = sockets.pinned.len(),
+                "spray: cleared"
+            );
+        }
+        sockets.list.clear();
+        sockets.pinned.clear();
+        self.0.any_pinned.store(false, Ordering::Release);
+        self.0.any_sockets.store(false, Ordering::Release);
+    }
+
+    /// Forgets the pin for `remote`: one of the regular sockets heard from it.
+    ///
+    /// A pin is only right while the spray socket's mapping is the only way to reach the
+    /// remote. Once the remote reaches a regular socket, that path works both ways and
+    /// sending from the spray socket would only make the remote see us from a second
+    /// port.
+    pub(crate) fn unpin(&self, remote: SocketAddr) {
+        if !self.0.any_pinned.load(Ordering::Acquire) {
+            return;
+        }
+        let remote = canonical(remote);
+        let mut sockets = self.0.sockets.lock().expect("poisoned");
+        if sockets.pinned.remove(&remote).is_some() {
+            debug!(%remote, "spray: remote reached a regular socket, unpinned");
+            self.0
+                .any_pinned
+                .store(!sockets.pinned.is_empty(), Ordering::Release);
+        }
     }
 
     /// The socket pinned to `remote`, if any.
