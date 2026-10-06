@@ -14,6 +14,11 @@
 //! [`SprayState::pinned`] before picking a socket.
 //!
 //! Only IPv4 is sprayed; symmetric NAT is an IPv4 phenomenon.
+//!
+//! Spraying is off unless `IROH_HOLEPUNCH_SPRAY` says otherwise (see [`SprayPolicy`]), and
+//! the number of extra sockets per round follows `IROH_HOLEPUNCH_SPRAY_SOCKETS`, capped at
+//! a quarter of the process' open-file soft limit so a small limit (iOS defaults to 256) is
+//! never exhausted by the spray.
 
 use std::{
     collections::HashMap,
@@ -32,8 +37,12 @@ use tracing::{debug, trace, warn};
 
 use super::RecvInfo;
 
-/// Number of extra sockets to spray from.
-pub(crate) const SPRAY_SOCKETS: usize = 256;
+/// Number of extra sockets to spray from, unless `IROH_HOLEPUNCH_SPRAY_SOCKETS` says otherwise.
+const DEFAULT_SPRAY_SOCKETS: usize = 256;
+/// Fewer sockets than this are not worth a round.
+const MIN_SPRAY_SOCKETS: usize = 16;
+/// Spray sockets never take more than this fraction of the open-file soft limit.
+const NOFILE_FRACTION: u64 = 4;
 /// How long unpinned spray sockets are kept after a spray, for the remote's probes to land.
 const SPRAY_TTL: Duration = Duration::from_secs(8);
 /// A pinned socket is released after this long without receiving anything.
@@ -43,29 +52,64 @@ const PINNED_IDLE: Duration = Duration::from_secs(90);
 const SPRAY_PAYLOAD: [u8; 4] = [0; 4];
 
 /// Whether this endpoint should spray, from the `IROH_HOLEPUNCH_SPRAY` environment variable.
+///
+/// The default is [`Off`](Self::Off): with a single QAD server net_report cannot tell the
+/// NAT type, so `auto` would spray on every hole punching round that did not produce a
+/// direct path, on every endpoint. Turning it on is a deployment decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SprayPolicy {
     /// Never spray.
     Off,
-    /// Spray when net_report found that this endpoint's NAT mapping varies by destination.
+    /// Spray when net_report found that this endpoint's NAT mapping varies by destination,
+    /// or, when net_report cannot tell, after a hole punching round without a direct path.
     Auto,
-    /// Spray on every hole punching round (for labs that only have one QAD server, so
-    /// net_report cannot tell the NAT type).
+    /// Spray on every hole punching round.
     Always,
 }
 
 impl SprayPolicy {
     fn from_env() -> Self {
         match std::env::var("IROH_HOLEPUNCH_SPRAY").as_deref() {
-            Ok("off") | Ok("0") => Self::Off,
+            Ok("auto") => Self::Auto,
             Ok("always") => Self::Always,
-            Ok(other) if !other.is_empty() && other != "auto" => {
-                warn!("IROH_HOLEPUNCH_SPRAY={other:?} not understood, using auto");
-                Self::Auto
+            Ok("off") | Ok("0") => Self::Off,
+            Ok(other) if !other.is_empty() => {
+                warn!("IROH_HOLEPUNCH_SPRAY={other:?} not understood, spraying is off");
+                Self::Off
             }
-            _ => Self::Auto,
+            _ => Self::Off,
         }
     }
+}
+
+/// How many sockets a spray round may bind: `IROH_HOLEPUNCH_SPRAY_SOCKETS` or the default,
+/// capped at a fraction of the open-file soft limit.
+fn spray_sockets_from_env() -> usize {
+    let wanted = std::env::var("IROH_HOLEPUNCH_SPRAY_SOCKETS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SPRAY_SOCKETS);
+    let capped = match nofile_soft_limit() {
+        Some(limit) => wanted.min((limit / NOFILE_FRACTION) as usize),
+        None => wanted,
+    };
+    if capped < wanted {
+        debug!(
+            wanted,
+            capped, "spray: socket count capped by the open-file limit"
+        );
+    }
+    capped.max(MIN_SPRAY_SOCKETS)
+}
+
+#[cfg(unix)]
+fn nofile_soft_limit() -> Option<u64> {
+    rustix::process::getrlimit(rustix::process::Resource::Nofile).current
+}
+
+#[cfg(not(unix))]
+fn nofile_soft_limit() -> Option<u64> {
+    None
 }
 
 const NAT_UNKNOWN: u8 = 0;
@@ -80,6 +124,8 @@ pub(crate) struct SprayState(Arc<Inner>);
 #[derive(Debug)]
 struct Inner {
     policy: SprayPolicy,
+    /// Sockets bound per spray round.
+    sockets_per_round: usize,
     /// Fast path for the senders: nothing is pinned.
     any_pinned: AtomicBool,
     /// Fast path for the receiver: no sockets at all.
@@ -108,6 +154,7 @@ impl Default for SprayState {
     fn default() -> Self {
         Self(Arc::new(Inner {
             policy: SprayPolicy::from_env(),
+            sockets_per_round: spray_sockets_from_env(),
             any_pinned: AtomicBool::new(false),
             any_sockets: AtomicBool::new(false),
             nat: AtomicU8::new(NAT_UNKNOWN),
@@ -143,7 +190,7 @@ impl SprayState {
         }
     }
 
-    /// Sends one datagram to each of `targets` from each of [`SPRAY_SOCKETS`] fresh sockets.
+    /// Sends one datagram to each of `targets` from each of `sockets_per_round` fresh sockets.
     ///
     /// Returns how many sockets were sprayed from. Only IPv4 targets are used.
     pub(crate) fn spray(&self, targets: &[SocketAddr]) -> usize {
@@ -159,8 +206,8 @@ impl SprayState {
         let now = Instant::now();
         sockets.expire(now, &self.0);
         let mut count = 0;
-        let mut fresh = Vec::with_capacity(SPRAY_SOCKETS);
-        for _ in 0..SPRAY_SOCKETS {
+        let mut fresh = Vec::with_capacity(self.0.sockets_per_round);
+        for _ in 0..self.0.sockets_per_round {
             let socket = match UdpSocket::bind_full((Ipv4Addr::UNSPECIFIED, 0)) {
                 Ok(socket) => Arc::new(socket),
                 Err(err) => {

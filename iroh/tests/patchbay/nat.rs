@@ -16,9 +16,10 @@
 //! is not yet working are marked `#[ignore]`.
 //!
 //! `Strict` against `Moderate` is punched with the birthday-paradox spray (see
-//! `socket::transports::spray`). With a single relay the NAT type is unknown, so the
-//! spray only starts after the first round failed, and each round has a ~63% chance:
-//! these tests get a longer timeout.
+//! `socket::transports::spray`), which is off by default: run those tests with
+//! `IROH_HOLEPUNCH_SPRAY=auto` and `--ignored`. With a single relay the NAT type is
+//! unknown, so the spray only starts after the first round failed, and each round has a
+//! ~63% chance: these tests get a longer timeout.
 
 use std::time::Duration;
 
@@ -149,6 +150,7 @@ async fn nat_moderate_x_moderate() -> Result {
 
 #[tokio::test]
 #[traced_test]
+#[ignore = "needs IROH_HOLEPUNCH_SPRAY=auto: spraying is off by default"]
 async fn nat_moderate_x_strict() -> Result {
     run_nat_holepunch(Nat::Moderate, Nat::Strict).await
 }
@@ -169,6 +171,7 @@ async fn nat_strict_x_open() -> Result {
 
 #[tokio::test]
 #[traced_test]
+#[ignore = "needs IROH_HOLEPUNCH_SPRAY=auto: spraying is off by default"]
 async fn nat_strict_x_moderate() -> Result {
     run_nat_holepunch(Nat::Strict, Nat::Moderate).await
 }

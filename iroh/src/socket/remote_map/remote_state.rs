@@ -54,6 +54,10 @@ const HOLEPUNCH_ATTEMPTS_INTERVAL: Duration = Duration::from_secs(5);
 const ADDR_EVENT_DEBOUNCE: Duration = Duration::from_millis(100);
 /// How many hole punching rounds per remote may spray (see `transports::spray`).
 const MAX_SPRAY_ROUNDS: u32 = 4;
+/// A spray round is not repeated sooner than this. Slightly under
+/// [`HOLEPUNCH_ATTEMPTS_INTERVAL`]: the hole punching rounds that trigger it come every
+/// interval, and with an equal threshold every other round would miss by microseconds.
+const SPRAY_MIN_INTERVAL: Duration = Duration::from_secs(4);
 /// How many random-port candidates a spraying round announces for the remote to probe.
 ///
 /// With 256 spray sockets this collides with ~63% per round, ~98% over four rounds.
@@ -1170,16 +1174,25 @@ impl State {
     /// IPv4 addresses and announces a new set of random ports on our public IPv4 address
     /// for the remote to probe (see `transports::spray`).
     fn maybe_spray(&mut self, conn: &noq::Connection) {
-        // Announcement order matters (see `spray_targets`); noq's candidate set has none,
-        // so it only fills in what the events did not deliver.
+        // Announcement order matters (see `spray_targets`); noq keeps it, the events are
+        // only a fallback.
         let targets = match conn.get_remote_nat_traversal_addresses() {
-            Ok(addrs) => spray_targets(self.remote_announced.iter().copied().chain(addrs)),
+            Ok(addrs) => spray_targets(
+                addrs
+                    .into_iter()
+                    .chain(self.remote_announced.iter().copied()),
+            ),
             Err(err) => {
                 debug!("spray: no remote candidates: {err:#}");
                 return;
             }
         };
-        let round_failed = self.last_holepunch.is_some();
+        // Only a round that probed something counts as failed; the first round often runs
+        // before the remote's candidates have arrived.
+        let round_failed = self
+            .last_holepunch
+            .as_ref()
+            .is_some_and(|hp| hp.remote_candidates.iter().any(|a| a.is_ipv4()));
         self.spray_for(conn, targets, round_failed);
     }
 
@@ -1188,9 +1201,9 @@ impl State {
     /// Only the client side runs hole punching rounds, but a server behind a symmetric
     /// NAT has to spray too. Its announced ports reach the client as ADD_ADDRESS frames,
     /// which make the client probe them. The client's addresses are those it announced in
-    /// REACH_OUT frames (surfaced as events by noq) plus whatever else we know of it, and
-    /// "a round failed" is approximated by the time since we first got here with no direct
-    /// path.
+    /// REACH_OUT frames (noq keeps them in arrival order, and surfaces them as events)
+    /// plus whatever else we know of it, and "a round failed" is approximated by the time
+    /// since we first got here with no direct path.
     fn maybe_spray_as_server(&mut self, conn: &noq::Connection) {
         let now = Instant::now();
         let since = *self.spray_server_since.get_or_insert(now);
@@ -1201,20 +1214,33 @@ impl State {
             return;
         }
         if let Some(last) = self.last_spray
-            && now.duration_since(last) < HOLEPUNCH_ATTEMPTS_INTERVAL
+            && now.duration_since(last) < SPRAY_MIN_INTERVAL
         {
             // The client's REACH_OUT frames arrive one by one; one spray per round.
             self.scheduled_holepunch = Some(last + HOLEPUNCH_ATTEMPTS_INTERVAL);
             return;
         }
+        // noq keeps the client's REACH_OUT addresses in arrival order; the events and the
+        // path state are fallbacks (the event channel drops the oldest events when a
+        // spraying client announces hundreds of addresses at once).
+        let announced = conn
+            .get_remote_nat_traversal_addresses()
+            .unwrap_or_default();
+        debug!(
+            announced = announced.len(),
+            announced_head = ?announced.iter().take(3).collect::<Vec<_>>(),
+            events_head = ?self.remote_announced.iter().take(3).collect::<Vec<_>>(),
+            paths = ?self.paths.addrs().collect::<Vec<_>>(),
+            "spray: server side candidates"
+        );
         let targets = spray_targets(
-            self.paths
-                .addrs()
-                .filter_map(|addr| match addr {
+            announced
+                .into_iter()
+                .chain(self.remote_announced.iter().copied())
+                .chain(self.paths.addrs().filter_map(|addr| match addr {
                     transports::Addr::Ip(addr) => Some(*addr),
                     _ => None,
-                })
-                .chain(self.remote_announced.iter().copied()),
+                })),
         );
         if self.spray_for(conn, targets, round_failed) && self.spray_rounds < MAX_SPRAY_ROUNDS {
             self.scheduled_holepunch = Some(now + HOLEPUNCH_ATTEMPTS_INTERVAL);
@@ -1240,7 +1266,7 @@ impl State {
         }
         let now = Instant::now();
         if let Some(last) = self.last_spray
-            && now.duration_since(last) < HOLEPUNCH_ATTEMPTS_INTERVAL
+            && now.duration_since(last) < SPRAY_MIN_INTERVAL
         {
             return false;
         }
@@ -1328,6 +1354,9 @@ fn spray_targets(addrs: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr>
     let mut per_ip: std::collections::BTreeMap<std::net::IpAddr, usize> = Default::default();
     let mut out = Vec::new();
     for addr in addrs {
+        // noq hands out addresses in the socket's family: IPv4-mapped IPv6 on a dual-stack
+        // socket.
+        let addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
         if !addr.is_ipv4() || out.contains(&addr) {
             continue;
         }

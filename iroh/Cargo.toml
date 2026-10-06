@@ -72,6 +72,9 @@ futures-util = "0.3"
 axum = { version = "0.8", optional = true }
 
 # non-wasm-in-browser dependencies
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["process"] }
+
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
 
 hickory-resolver = { version = "0.26.0", default-features = false }

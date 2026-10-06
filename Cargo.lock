@@ -2234,6 +2234,7 @@ dependencies = [
  "rand_chacha 0.10.0",
  "reqwest",
  "rustc-hash",
+ "rustix",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -3111,7 +3112,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.2.0"
-source = "git+https://github.com/huangyingw/noq.git?rev=57427c9c42ab0241fd7de7f98971b5d9a62e63de#57427c9c42ab0241fd7de7f98971b5d9a62e63de"
+source = "git+https://github.com/huangyingw/noq.git?rev=868d569e55460b12ef99ff971db793249808941a#868d569e55460b12ef99ff971db793249808941a"
 dependencies = [
  "aes-gcm",
  "aws-lc-rs",
